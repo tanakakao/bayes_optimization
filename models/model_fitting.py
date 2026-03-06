@@ -155,6 +155,7 @@ def fit_regression_model(
     alpha: float = 1e-1,
     lr: float = 1e-2,
     epoch: int = 300,
+    list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> Any:
     """回帰モデルの構築と学習を一括で行う。"""
@@ -314,6 +315,8 @@ def fit_classification_model(
     categorical_idx: Optional[List[int]] = None,
     target_class: Optional[List[Any]] = None,
     bounds: torch.Tensor = None,
+    deep_gp: bool = False,
+    list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> Any:
     """単一のバイナリ分類 GP モデルを構築・学習する。"""
@@ -330,11 +333,22 @@ def fit_classification_model(
 
     if categorical_idx:
         model = ClassifierMixedGPBinaryFromMulticlass(
-            train_X, train_Y, target_class, categorical_idx, input_transform=tf_normalize
+            train_X,
+            train_Y,
+            target_class,
+            categorical_idx,
+            input_transform=tf_normalize,
+            deep_gp=deep_gp,
+            list_hidden_dims=list_hidden_dims,
         )
     else:
         model = ClassifierGPBinaryFromMulticlass(
-            train_X, train_Y, target_class, input_transform=tf_normalize
+            train_X,
+            train_Y,
+            target_class,
+            input_transform=tf_normalize,
+            deep_gp=deep_gp,
+            list_hidden_dims=list_hidden_dims,
         )
 
     if not build_only:
@@ -350,6 +364,8 @@ def fit_classification_models(
     categorical_idx: Optional[List[int]] = None,
     target_classes: Optional[List[List[Any]]] = None,
     bounds: torch.Tensor = None,
+    deep_gp: bool = False,
+    list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> List[Any]:
     """複数のターゲットに対するバイナリ分類モデル群を構築する。"""
@@ -363,6 +379,8 @@ def fit_classification_models(
             categorical_idx=categorical_idx,
             target_class=t_class,
             bounds=bounds,
+            deep_gp=deep_gp,
+            list_hidden_dims=list_hidden_dims,
             build_only=build_only,
         )
         for t_class in target_classes
@@ -392,6 +410,7 @@ def fit_model(
     alpha: float = 1e-1,
     lr: float = 1e-2,
     epoch: int = 300,
+    list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> Any:
     """統合インターフェース：回帰と分類（混合含む）を自動で振り分ける。"""
@@ -435,6 +454,8 @@ def fit_model(
                 categorical_idx=categorical_idx,
                 target_classes=[[1.0]],
                 bounds=bounds,
+                deep_gp=deep_gp,
+                list_hidden_dims=list_hidden_dims,
                 build_only=build_only,
             )[0]
             models.append(cls_model)

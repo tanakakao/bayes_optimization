@@ -1,5 +1,6 @@
 import gpytorch
 from gpytorch.models import ApproximateGP
+from gpytorch.models.deep_gps import DeepGP
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
 from gpytorch.likelihoods import BernoulliLikelihood
 from gpytorch.likelihoods import SoftmaxLikelihood
@@ -26,7 +27,9 @@ import torch
 from torch import cdist, Tensor
 from torch.distributions import Bernoulli
 from torch.nn import Module
-from typing import Optional, Union, Sequence, Tuple
+from typing import Optional, Union, Sequence, Tuple, List
+
+from ..deep_gp.layers import DeepGPHiddenLayer, DeepMixedGPHiddenLayer
 
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.posteriors.posterior import Posterior
@@ -223,6 +226,63 @@ class GPClassificationModel(ApproximateGP):
         # 多変量正規分布として返す（分類なので SoftmaxLikelihood と組み合わせる想定）
         return gpytorch.distributions.MultivariateNormal(mean, covar)
 
+
+class DeepGPClassificationModel(DeepGP):
+    """2値分類向けの Deep Gaussian Process モデル。"""
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        list_hidden_dims: Optional[List[int]] = None,
+        num_inducing_points: int = 64,
+    ):
+        super().__init__()
+        if list_hidden_dims is None:
+            list_hidden_dims = [8]
+
+        input_dim = train_X.shape[-1]
+        input_dims = input_dim
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+
+        self.hidden_layers = torch.nn.ModuleList()
+        for hidden_dim in list_hidden_dims:
+            self.hidden_layers.append(
+                DeepGPHiddenLayer(
+                    input_dims=input_dims,
+                    output_dims=hidden_dim,
+                    num_inducing=num_inducing,
+                    mean_type="linear",
+                )
+            )
+            input_dims = hidden_dim
+
+        self.last_layer = DeepGPHiddenLayer(
+            input_dims=input_dims,
+            output_dims=None,
+            num_inducing=num_inducing,
+            mean_type="constant",
+        )
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, inputs, batch_mean: bool = True):
+        if isinstance(inputs, tuple):
+            inputs = inputs[0]
+
+        h = inputs
+        for layer in self.hidden_layers:
+            h = layer(h)
+
+        output = self.last_layer(h)
+        if not batch_mean:
+            return output
+
+        mean_x = output.mean.mean(0)
+        covar_x = output.covariance_matrix.mean(0)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
 # class ClassifierGP(Model):
 #     """
 #     分類タスク用のガウス過程モデルラッパークラス。
@@ -328,6 +388,79 @@ class GPClassificationModel(ApproximateGP):
 #         """
 #         return self.model.batch_shape
 
+
+
+class DeepMixedGPClassificationModel(DeepGP):
+    """カテゴリ変数を含む2値分類向け Deep Gaussian Process モデル。"""
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        cat_dims: Sequence[int],
+        list_hidden_dims: Optional[List[int]] = None,
+        num_inducing_points: int = 64,
+    ):
+        super().__init__()
+        if list_hidden_dims is None:
+            list_hidden_dims = [8]
+        if len(cat_dims) == 0:
+            raise ValueError("カテゴリ次元を指定する必要があります (cat_dims)。")
+
+        d = train_X.shape[-1]
+        cat_dims = normalize_indices(indices=cat_dims, d=d)
+        ord_dims = sorted(set(range(d)) - set(cat_dims))
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+
+        first_hidden_dim = list_hidden_dims[0]
+        self.input_layer = DeepMixedGPHiddenLayer(
+            input_dims=d,
+            output_dims=first_hidden_dim,
+            ord_dims=ord_dims,
+            cat_dims=cat_dims,
+            num_inducing=num_inducing,
+            mean_type="linear",
+            input_data=train_X,
+        )
+
+        self.hidden_layers = torch.nn.ModuleList()
+        in_dim = first_hidden_dim
+        for hidden_dim in list_hidden_dims[1:]:
+            self.hidden_layers.append(
+                DeepGPHiddenLayer(
+                    input_dims=in_dim,
+                    output_dims=hidden_dim,
+                    num_inducing=num_inducing,
+                    mean_type="linear",
+                )
+            )
+            in_dim = hidden_dim
+
+        self.last_layer = DeepGPHiddenLayer(
+            input_dims=in_dim,
+            output_dims=None,
+            num_inducing=num_inducing,
+            mean_type="constant",
+        )
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, inputs, batch_mean: bool = True):
+        if isinstance(inputs, tuple):
+            inputs = inputs[0]
+
+        h = self.input_layer(inputs)
+        for layer in self.hidden_layers:
+            h = layer(h)
+
+        output = self.last_layer(h)
+        if not batch_mean:
+            return output
+
+        mean_x = output.mean.mean(0)
+        covar_x = output.covariance_matrix.mean(0)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 class ClassifierGPBinaryFromMulticlass(Model):
     """
     マルチクラス分類ラベルから任意のクラス集合を「1」、その他を「0」として
@@ -349,6 +482,8 @@ class ClassifierGPBinaryFromMulticlass(Model):
         model: Optional[GPClassificationModel] = None,
         likelihood: Optional[BernoulliLikelihood] = None,
         input_transform: Union[str, InputTransform, None] = "DEFAULT",
+        deep_gp: bool = False,
+        list_hidden_dims: Optional[List[int]] = None,
         num_inducing_points: int = 20,
     ):
         """
@@ -392,13 +527,19 @@ class ClassifierGPBinaryFromMulticlass(Model):
         transformed_train_X = self.input_transform(train_X) if self.input_transform else train_X
 
         # 内部GPモデルの初期化時に、変換済みのXを渡す
-        self.model = (
-            model
-            if model is not None
-            else GPClassificationModel(
+        if model is not None:
+            self.model = model
+        elif deep_gp:
+            self.model = DeepGPClassificationModel(
+                transformed_train_X,
+                self.train_targets,
+                list_hidden_dims=list_hidden_dims,
+                num_inducing_points=max(num_inducing_points, 32),
+            )
+        else:
+            self.model = GPClassificationModel(
                 transformed_train_X, self.train_targets, num_inducing_points
             )
-        )
         self.likelihood = likelihood if likelihood is not None else BernoulliLikelihood()
 
         # GPU/CPU に合わせてモデルを転送
@@ -880,6 +1021,8 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
         model: Optional[ApproximateGP] = None,
         likelihood: Optional[BernoulliLikelihood] = None,
         input_transform=None,  # Union[str, InputTransform, None] にしていてもOK
+        deep_gp: bool = False,
+        list_hidden_dims: Optional[List[int]] = None,
         num_inducing_points: int = 20,
     ):
         super().__init__()
@@ -921,9 +1064,20 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
         # 内部モデルに渡す train_X は transform 後
         transformed_train_X = self.input_transform(train_X) if self.input_transform else train_X
 
-        self.model = model if model is not None else GPClassificationMixedModel(
-            transformed_train_X, self.train_targets, cat_dims
-        )
+        if model is not None:
+            self.model = model
+        elif deep_gp:
+            self.model = DeepMixedGPClassificationModel(
+                transformed_train_X,
+                self.train_targets,
+                cat_dims=cat_dims,
+                list_hidden_dims=list_hidden_dims,
+                num_inducing_points=max(num_inducing_points, 32),
+            )
+        else:
+            self.model = GPClassificationMixedModel(
+                transformed_train_X, self.train_targets, cat_dims, num_inducing_points
+            )
         self.likelihood = likelihood if likelihood is not None else BernoulliLikelihood()
 
         self.to(device=train_X.device, dtype=train_X.dtype)
