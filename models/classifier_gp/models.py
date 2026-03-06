@@ -1342,23 +1342,33 @@ def fit_classifier_mll(mll):
     Note:
         - 学習回数は 300 エポックに固定されています。
         - 学習率は固定（lr=0.01）で Adam オプティマイザを使用します。
+        - DeepGP の場合は ELBO 用に `batch_mean=False` の出力を使用します。
     """
     # モデルと尤度を学習モードに設定
     mll.model.train()
     mll.likelihood.train()
-    
+
     # Adam オプティマイザを初期化（学習率: 0.01）
     optimizer = torch.optim.Adam(mll.model.parameters(), lr=0.01)
+
+    y_tensor = mll.model.train_targets
+    x_tensor = mll.model.train_inputs[0] if isinstance(mll.model.train_inputs, tuple) else mll.model.train_inputs
 
     # 300 エポック学習
     for i in range(300):
         optimizer.zero_grad()  # 勾配を初期化
 
-        # モデルの出力を計算（train_inputs は mll.model 内部に保持）
-        output = mll.model(mll.model.train_inputs)
+        # DeepGP は ELBO にサンプル次元を保った出力を渡す
+        if isinstance(mll.model, DeepGP):
+            output = mll.model.forward(x_tensor, batch_mean=False)
+        else:
+            output = mll.model(x_tensor)
 
         # 変分 ELBO を最大化（損失関数はマイナスを取る）
-        loss = -mll(output, mll.model.train_targets)
+        if (y_tensor.ndim > 1) and (y_tensor.shape[-1] == 1):
+            loss = -mll(output, y_tensor.view(-1))
+        else:
+            loss = -mll(output, y_tensor)
 
         # 勾配計算と更新
         loss.backward()
