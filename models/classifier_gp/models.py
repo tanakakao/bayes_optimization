@@ -510,7 +510,7 @@ class ClassifierGPBinaryFromMulticlass(Model):
         # 指定クラスなら 1.0、それ以外なら 0.0 とする
         self.train_targets = torch.tensor([
             float(y.item() in self.target_class_set) for y in train_Y
-        ], device=train_Y.device)
+        ], device=train_Y.device, dtype=train_X.dtype)
 
         # --- GP モデルと Bernoulli 尤度を構築（または受け取る） ---
         self.input_transform = input_transform # この時点で input_transform は初期化済み

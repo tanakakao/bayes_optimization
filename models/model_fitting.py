@@ -239,6 +239,7 @@ def fit_regression_model(
             deep_gp=deep_gp,
             deep_kernel=deep_kernel,
             input_transform=input_tf,
+            list_hidden_dims=list_hidden_dims,
         )
 
     # (C) SAAS (高次元)
@@ -437,6 +438,7 @@ def fit_model(
             alpha=alpha,
             lr=lr,
             epoch=epoch,
+            list_hidden_dims=list_hidden_dims,
             build_only=build_only,
         )
         return model
@@ -478,6 +480,7 @@ def fit_model(
                 alpha=alpha,
                 lr=lr,
                 epoch=epoch,
+                list_hidden_dims=list_hidden_dims,
                 build_only=build_only,
             )
             models.append(reg_model)
