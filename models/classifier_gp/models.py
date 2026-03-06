@@ -1370,6 +1370,11 @@ def fit_classifier_mll(mll):
         else:
             loss = -mll(output, y_tensor)
 
+        # DeepGP の ELBO は設定次第でベクトルになることがあるため、
+        # 逆伝播前に必ずスカラー化する
+        if loss.ndim > 0:
+            loss = loss.mean()
+
         # 勾配計算と更新
         loss.backward()
         optimizer.step()
