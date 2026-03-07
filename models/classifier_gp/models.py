@@ -98,6 +98,16 @@ class SimpleBernoulliPosterior(GPyTorchPosterior):
         """
         return self._variance
 
+
+    @property
+    def batch_range(self) -> tuple[int, int]:
+        """
+        MC サンプラーが t-batch 次元を推定するための範囲。
+
+        `mean` / `variance` を [..., q]（最後が event 相当）として扱い、
+        それ以前を batch 次元とみなす。
+        """
+        return (0, -1)
     @property
     def device(self):
         """
