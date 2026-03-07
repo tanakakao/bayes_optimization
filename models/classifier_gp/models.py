@@ -100,6 +100,11 @@ class SimpleBernoulliPosterior(GPyTorchPosterior):
 
 
     @property
+    def _is_mt(self) -> bool:
+        """BoTorch 互換: この posterior は multitask ではない。"""
+        return False
+
+    @property
     def batch_range(self) -> tuple[int, int]:
         """
         MC サンプラーが t-batch 次元を推定するための範囲。
@@ -108,6 +113,7 @@ class SimpleBernoulliPosterior(GPyTorchPosterior):
         それ以前を batch 次元とみなす。
         """
         return (0, -1)
+
     @property
     def device(self):
         """
