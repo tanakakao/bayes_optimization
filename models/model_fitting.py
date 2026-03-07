@@ -317,6 +317,7 @@ def fit_classification_model(
     target_class: Optional[List[Any]] = None,
     bounds: torch.Tensor = None,
     deep_gp: bool = False,
+    deep_kernel: bool = False,
     list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> Any:
@@ -340,6 +341,7 @@ def fit_classification_model(
             categorical_idx,
             input_transform=tf_normalize,
             deep_gp=deep_gp,
+            deep_kernel=deep_kernel,
             list_hidden_dims=list_hidden_dims,
         )
     else:
@@ -349,6 +351,7 @@ def fit_classification_model(
             target_class,
             input_transform=tf_normalize,
             deep_gp=deep_gp,
+            deep_kernel=deep_kernel,
             list_hidden_dims=list_hidden_dims,
         )
 
@@ -366,6 +369,7 @@ def fit_classification_models(
     target_classes: Optional[List[List[Any]]] = None,
     bounds: torch.Tensor = None,
     deep_gp: bool = False,
+    deep_kernel: bool = False,
     list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> List[Any]:
@@ -381,6 +385,7 @@ def fit_classification_models(
             target_class=t_class,
             bounds=bounds,
             deep_gp=deep_gp,
+            deep_kernel=deep_kernel,
             list_hidden_dims=list_hidden_dims,
             build_only=build_only,
         )
@@ -457,6 +462,7 @@ def fit_model(
                 target_classes=[[1.0]],
                 bounds=bounds,
                 deep_gp=deep_gp,
+                deep_kernel=deep_kernel,
                 list_hidden_dims=list_hidden_dims,
                 build_only=build_only,
             )[0]

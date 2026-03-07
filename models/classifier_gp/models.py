@@ -29,11 +29,19 @@ from torch.distributions import Bernoulli
 from torch.nn import Module
 from typing import Optional, Union, Sequence, Tuple, List
 
+from ..deep_gp.layers import (
+    DeepGPHiddenLayer,
+    DeepMixedGPHiddenLayer,
+    DeepKernelDeepGPHiddenLayer,
+    DeepKernelDeepMixedGPHiddenLayer,
+)
 from ..deep_gp.layers import DeepGPHiddenLayer, DeepMixedGPHiddenLayer
 
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.posteriors.posterior import Posterior
 from botorch.models.transforms.input import InputTransform  # ★ 追加
+from ..deep_gp.utils import LargeFeatureExtractor
+from gpytorch.utils.grid import ScaleToBounds
 from gpytorch.distributions import MultivariateNormal
 import torch
 
@@ -283,6 +291,258 @@ class DeepGPClassificationModel(DeepGP):
         covar_x = output.covariance_matrix.mean(0)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+
+class DeepKernelClassificationModel(ApproximateGP):
+    """2値分類向け DeepKernel (DKL) 近似GP。"""
+
+    def __init__(self, train_X: Tensor, train_Y: Tensor, num_inducing_points: int = 20):
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+        input_dims = train_X.shape[-1]
+
+        variational_distribution = CholeskyVariationalDistribution(num_inducing_points=num_inducing)
+        if train_X.shape[0] > num_inducing:
+            rand_indices = torch.randperm(train_X.shape[0], device=train_X.device)[:num_inducing]
+            inducing_points = train_X[rand_indices].clone()
+        else:
+            inducing_points = train_X.clone()
+
+        variational_strategy = VariationalStrategy(
+            self,
+            inducing_points=inducing_points,
+            variational_distribution=variational_distribution,
+        )
+        super().__init__(variational_strategy)
+
+        self.feature_extractor = LargeFeatureExtractor(input_dim=input_dims, output_dim=input_dims)
+        self.scale_to_bounds = ScaleToBounds(-1.0, 1.0)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=input_dims))
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, x: Tensor):
+        projected_x = self.scale_to_bounds(self.feature_extractor(x))
+        mean = self.mean_module(projected_x)
+        covar = self.covar_module(projected_x)
+        return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+
+class DeepKernelMixedClassificationModel(ApproximateGP):
+    """カテゴリ入力を含む2値分類向け DeepKernel (DKL) 近似GP。"""
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        cat_dims: Sequence[int],
+        num_inducing_points: int = 20,
+    ):
+        if len(cat_dims) == 0:
+            raise ValueError("カテゴリ次元を指定する必要があります (cat_dims)。")
+
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+        variational_distribution = CholeskyVariationalDistribution(num_inducing_points=num_inducing)
+        if train_X.shape[0] > num_inducing:
+            rand_indices = torch.randperm(train_X.shape[0], device=train_X.device)[:num_inducing]
+            inducing_points = train_X[rand_indices].clone()
+        else:
+            inducing_points = train_X.clone()
+
+        variational_strategy = VariationalStrategy(
+            self,
+            inducing_points=inducing_points,
+            variational_distribution=variational_distribution,
+        )
+        super().__init__(variational_strategy)
+
+        d = train_X.shape[-1]
+        self.cat_dims = normalize_indices(indices=cat_dims, d=d)
+        self.ord_dims = sorted(set(range(d)) - set(self.cat_dims))
+
+        if len(self.ord_dims) > 0:
+            self.feature_extractor = LargeFeatureExtractor(
+                input_dim=len(self.ord_dims),
+                output_dim=len(self.ord_dims),
+            )
+            self.scale_to_bounds = ScaleToBounds(-1.0, 1.0)
+
+        self.mean_module = gpytorch.means.ConstantMean()
+
+        if len(self.ord_dims) == 0:
+            self.covar_module = ScaleKernel(
+                CategoricalKernel(
+                    ard_num_dims=len(self.cat_dims),
+                    active_dims=self.cat_dims,
+                    lengthscale_constraint=GreaterThan(1e-6),
+                )
+            )
+        else:
+            cont_kernel_factory = get_covar_module_with_dim_scaled_prior
+            sum_kernel = ScaleKernel(
+                cont_kernel_factory(ard_num_dims=len(self.ord_dims), active_dims=self.ord_dims)
+                + ScaleKernel(
+                    CategoricalKernel(
+                        ard_num_dims=len(self.cat_dims),
+                        active_dims=self.cat_dims,
+                        lengthscale_constraint=GreaterThan(1e-6),
+                    )
+                )
+            )
+            prod_kernel = ScaleKernel(
+                cont_kernel_factory(ard_num_dims=len(self.ord_dims), active_dims=self.ord_dims)
+                * CategoricalKernel(
+                    ard_num_dims=len(self.cat_dims),
+                    active_dims=self.cat_dims,
+                    lengthscale_constraint=GreaterThan(1e-6),
+                )
+            )
+            self.covar_module = sum_kernel + prod_kernel
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, x: Tensor):
+        restored_x = x
+        if len(self.ord_dims) > 0:
+            ord_x = x[..., self.ord_dims]
+            projected_ord_x = self.scale_to_bounds(self.feature_extractor(ord_x))
+            restored_x = x.clone()
+            restored_x[..., self.ord_dims] = projected_ord_x
+
+        mean = self.mean_module(restored_x)
+        covar = self.covar_module(restored_x)
+        return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+
+class DeepKernelDeepGPClassificationModel(DeepGP):
+    """2値分類向け DeepKernel + DeepGP モデル。"""
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        list_hidden_dims: Optional[List[int]] = None,
+        num_inducing_points: int = 64,
+    ):
+        super().__init__()
+        if list_hidden_dims is None:
+            list_hidden_dims = [8]
+
+        input_dims = train_X.shape[-1]
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+
+        self.hidden_layers = torch.nn.ModuleList()
+        for hidden_dim in list_hidden_dims:
+            self.hidden_layers.append(
+                DeepGPHiddenLayer(
+                    input_dims=input_dims,
+                    output_dims=hidden_dim,
+                    num_inducing=num_inducing,
+                    mean_type="linear",
+                )
+            )
+            input_dims = hidden_dim
+
+        self.last_layer = DeepKernelDeepGPHiddenLayer(
+            input_dims=input_dims,
+            output_dims=None,
+            num_inducing=num_inducing,
+            mean_type="constant",
+        )
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, inputs, batch_mean: bool = True):
+        if isinstance(inputs, tuple):
+            inputs = inputs[0]
+
+        h = inputs
+        for layer in self.hidden_layers:
+            h = layer(h)
+
+        output = self.last_layer(h)
+        if not batch_mean:
+            return output
+
+        mean_x = output.mean.mean(0)
+        covar_x = output.covariance_matrix.mean(0)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class DeepKernelDeepMixedGPClassificationModel(DeepGP):
+    """カテゴリ入力を含む2値分類向け DeepKernel + DeepGP モデル。"""
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        cat_dims: Sequence[int],
+        list_hidden_dims: Optional[List[int]] = None,
+        num_inducing_points: int = 64,
+    ):
+        super().__init__()
+        if list_hidden_dims is None:
+            list_hidden_dims = [8]
+        if len(cat_dims) == 0:
+            raise ValueError("カテゴリ次元を指定する必要があります (cat_dims)。")
+
+        d = train_X.shape[-1]
+        cat_dims = normalize_indices(indices=cat_dims, d=d)
+        ord_dims = sorted(set(range(d)) - set(cat_dims))
+        num_inducing = min(train_X.shape[0], num_inducing_points)
+
+        first_hidden_dim = list_hidden_dims[0]
+        self.input_layer = DeepKernelDeepMixedGPHiddenLayer(
+            input_dims=d,
+            output_dims=first_hidden_dim,
+            ord_dims=ord_dims,
+            cat_dims=cat_dims,
+            num_inducing=num_inducing,
+            mean_type="linear",
+            input_data=train_X,
+        )
+
+        self.hidden_layers = torch.nn.ModuleList()
+        in_dim = first_hidden_dim
+        for hidden_dim in list_hidden_dims[1:]:
+            self.hidden_layers.append(
+                DeepGPHiddenLayer(
+                    input_dims=in_dim,
+                    output_dims=hidden_dim,
+                    num_inducing=num_inducing,
+                    mean_type="linear",
+                )
+            )
+            in_dim = hidden_dim
+
+        self.last_layer = DeepGPHiddenLayer(
+            input_dims=in_dim,
+            output_dims=None,
+            num_inducing=num_inducing,
+            mean_type="constant",
+        )
+
+        self.train_inputs = train_X
+        self.train_targets = train_Y
+
+    def forward(self, inputs, batch_mean: bool = True):
+        if isinstance(inputs, tuple):
+            inputs = inputs[0]
+
+        h = self.input_layer(inputs)
+        for layer in self.hidden_layers:
+            h = layer(h)
+
+        output = self.last_layer(h)
+        if not batch_mean:
+            return output
+
+        mean_x = output.mean.mean(0)
+        covar_x = output.covariance_matrix.mean(0)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
 # class ClassifierGP(Model):
 #     """
 #     分類タスク用のガウス過程モデルラッパークラス。
@@ -483,6 +743,7 @@ class ClassifierGPBinaryFromMulticlass(Model):
         likelihood: Optional[BernoulliLikelihood] = None,
         input_transform: Union[str, InputTransform, None] = "DEFAULT",
         deep_gp: bool = False,
+        deep_kernel: bool = False,
         list_hidden_dims: Optional[List[int]] = None,
         num_inducing_points: int = 20,
     ):
@@ -529,12 +790,23 @@ class ClassifierGPBinaryFromMulticlass(Model):
         # 内部GPモデルの初期化時に、変換済みのXを渡す
         if model is not None:
             self.model = model
+        elif deep_gp and deep_kernel:
+            self.model = DeepKernelDeepGPClassificationModel(
+                transformed_train_X,
+                self.train_targets,
+                list_hidden_dims=list_hidden_dims,
+                num_inducing_points=max(num_inducing_points, 32),
+            )
         elif deep_gp:
             self.model = DeepGPClassificationModel(
                 transformed_train_X,
                 self.train_targets,
                 list_hidden_dims=list_hidden_dims,
                 num_inducing_points=max(num_inducing_points, 32),
+            )
+        elif deep_kernel:
+            self.model = DeepKernelClassificationModel(
+                transformed_train_X, self.train_targets, num_inducing_points
             )
         else:
             self.model = GPClassificationModel(
@@ -1022,6 +1294,7 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
         likelihood: Optional[BernoulliLikelihood] = None,
         input_transform=None,  # Union[str, InputTransform, None] にしていてもOK
         deep_gp: bool = False,
+        deep_kernel: bool = False,
         list_hidden_dims: Optional[List[int]] = None,
         num_inducing_points: int = 20,
     ):
@@ -1066,6 +1339,14 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
 
         if model is not None:
             self.model = model
+        elif deep_gp and deep_kernel:
+            self.model = DeepKernelDeepMixedGPClassificationModel(
+                transformed_train_X,
+                self.train_targets,
+                cat_dims=cat_dims,
+                list_hidden_dims=list_hidden_dims,
+                num_inducing_points=max(num_inducing_points, 32),
+            )
         elif deep_gp:
             self.model = DeepMixedGPClassificationModel(
                 transformed_train_X,
@@ -1073,6 +1354,10 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
                 cat_dims=cat_dims,
                 list_hidden_dims=list_hidden_dims,
                 num_inducing_points=max(num_inducing_points, 32),
+            )
+        elif deep_kernel:
+            self.model = DeepKernelMixedClassificationModel(
+                transformed_train_X, self.train_targets, cat_dims, num_inducing_points
             )
         else:
             self.model = GPClassificationMixedModel(
