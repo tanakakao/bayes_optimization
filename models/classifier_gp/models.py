@@ -35,6 +35,7 @@ from ..deep_gp.layers import (
     DeepKernelDeepGPHiddenLayer,
     DeepKernelDeepMixedGPHiddenLayer,
 )
+from ..deep_gp.layers import DeepGPHiddenLayer, DeepMixedGPHiddenLayer
 
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.posteriors.posterior import Posterior
