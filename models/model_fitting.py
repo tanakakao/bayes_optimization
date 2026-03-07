@@ -10,6 +10,7 @@ from gpytorch.mlls import (
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.model_list_gp_regression import ModelListGPyTorchModel
+from botorch.models import SingleTaskGP, MixedSingleTaskGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.models.relevance_pursuit import forward_relevance_pursuit
 
@@ -308,6 +309,121 @@ def fit_regression_model(
 
 
 # ---------------------------------------------------------------------
+# 分類モデル（heteroscedastic 補助）
+# ---------------------------------------------------------------------
+def _fit_classification_noise_model(
+    model: Any,
+    train_X: torch.Tensor,
+    categorical_idx: Optional[List[int]] = None,
+) -> Any:
+    """分類モデルに対して入力依存ノイズ（log-variance）モデルを学習して付与する。"""
+    if categorical_idx is None:
+        categorical_idx = []
+
+    with torch.no_grad():
+        model.eval()
+        model.likelihood.eval()
+        base_post = model.posterior(train_X, observation_noise=False)
+        p = base_post.mean
+        y = model.train_targets
+        if y.ndim < p.ndim:
+            y = y.unsqueeze(-1)
+        if p.ndim < y.ndim:
+            p = p.unsqueeze(-1)
+        residual_sq = (p - y).pow(2).clamp_min(1e-6)
+        train_Y_log_var = torch.log(residual_sq)
+
+    transformed_train_X = model.input_transform(train_X) if getattr(model, "input_transform", None) else train_X
+
+    if categorical_idx:
+        noise_model = MixedSingleTaskGP(
+            transformed_train_X,
+            train_Y_log_var,
+            cat_dims=categorical_idx,
+        )
+    else:
+        noise_model = SingleTaskGP(
+            transformed_train_X,
+            train_Y_log_var,
+        )
+
+    mll_noise = ExactMarginalLogLikelihood(noise_model.likelihood, noise_model)
+    fit_gpytorch_mll(mll_noise)
+
+    model.noise_model = noise_model.to(train_X)
+    model.noise_model_uses_transformed_inputs = True
+    return model
+
+
+# ---------------------------------------------------------------------
+# 分類モデル（robust 補助）
+# ---------------------------------------------------------------------
+def _refit_classification_model_with_rrp_style_filter(
+    model: Any,
+    train_X: torch.Tensor,
+    numbers_of_outliers: Optional[List[int]] = None,
+) -> Any:
+    """
+    分類モデル向けの簡易 Robust Relevance Pursuit 近似。
+
+    1) まず通常学習済みモデルで学習点の誤差 |p-y| を評価
+    2) 指定個数の外れ候補（既定: [0,1,2,3] の最大値）を除外
+    3) inlier のみで再学習
+
+    回帰側の `numbers_of_outliers` パラメータ構成に合わせるため、
+    ここでは最大値を採用する簡易実装としている。
+    """
+    if numbers_of_outliers is None or len(numbers_of_outliers) == 0:
+        numbers_of_outliers = [0, 1, 2, 3]
+
+    with torch.no_grad():
+        model.eval()
+        model.likelihood.eval()
+        post = model.posterior(train_X, observation_noise=False)
+        p = post.mean
+        y = model.train_targets
+        if y.ndim < p.ndim:
+            y = y.unsqueeze(-1)
+        if p.ndim < y.ndim:
+            p = p.unsqueeze(-1)
+        err = (p - y).abs().reshape(-1)
+
+    n = err.numel()
+    n_out = int(max(numbers_of_outliers))
+    n_out = max(0, min(n_out, max(0, n - 1)))
+    if n_out == 0:
+        return model
+
+    out_idx = torch.topk(err, k=n_out, largest=True).indices
+    inlier_mask = torch.ones(n, dtype=torch.bool, device=train_X.device)
+    inlier_mask[out_idx] = False
+
+    # wrapper 側の学習データ（raw）を更新
+    train_X_inlier = train_X[inlier_mask]
+    train_y_inlier = model.train_targets.reshape(-1)[inlier_mask]
+    model.set_train_data(inputs=train_X_inlier, targets=train_y_inlier, strict=False)
+
+    # latent GP 側の学習データ（transform 後）を更新
+    transformed_X_inlier = (
+        model.input_transform(train_X_inlier)
+        if getattr(model, "input_transform", None)
+        else train_X_inlier
+    )
+    model.model.train_inputs = transformed_X_inlier
+    model.model.train_targets = train_y_inlier
+    model.model._train_inputs_transformed = transformed_X_inlier
+    model.model._train_targets = train_y_inlier
+
+    mll = VariationalELBO(
+        model.likelihood,
+        model.model,
+        num_data=train_X_inlier.shape[0],
+    )
+    fit_classifier_mll(mll)
+    return model
+
+
+# ---------------------------------------------------------------------
 # 分類モデル
 # ---------------------------------------------------------------------
 def fit_classification_model(
@@ -318,6 +434,9 @@ def fit_classification_model(
     bounds: torch.Tensor = None,
     deep_gp: bool = False,
     deep_kernel: bool = False,
+    robust: bool = False,
+    perturbation: bool = False,
+    heteroscedastic: bool = False,
     list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> Any:
@@ -327,11 +446,13 @@ def fit_classification_model(
     if target_class is None:
         target_class = []
 
-    # Normalize のみ（分類は Perturbation なし前提）
-    dim = train_X.shape[-1]
-    from botorch.models.transforms.input import Normalize
+    input_tf = build_input_transform(
+        train_X=train_X,
+        bounds=bounds,
+        perturbation=perturbation,
+        categorical_idx=categorical_idx,
+    )
 
-    tf_normalize = Normalize(d=dim, bounds=bounds)
 
     if categorical_idx:
         model = ClassifierMixedGPBinaryFromMulticlass(
@@ -340,6 +461,7 @@ def fit_classification_model(
             target_class,
             categorical_idx,
             input_transform=tf_normalize,
+            input_transform=input_tf,
             deep_gp=deep_gp,
             deep_kernel=deep_kernel,
             list_hidden_dims=list_hidden_dims,
@@ -350,6 +472,7 @@ def fit_classification_model(
             train_Y,
             target_class,
             input_transform=tf_normalize,
+            input_transform=input_tf,
             deep_gp=deep_gp,
             deep_kernel=deep_kernel,
             list_hidden_dims=list_hidden_dims,
@@ -358,6 +481,21 @@ def fit_classification_model(
     if not build_only:
         mll = VariationalELBO(model.likelihood, model.model, num_data=train_Y.shape[0])
         fit_classifier_mll(mll)
+
+        if robust:
+            model = _refit_classification_model_with_rrp_style_filter(
+                model=model,
+                train_X=train_X,
+                numbers_of_outliers=[0, 1, 2, 3],
+            )
+
+        if heteroscedastic:
+            noise_train_X = model.train_inputs[0] if isinstance(model.train_inputs, tuple) else model.train_inputs
+            model = _fit_classification_noise_model(
+                model=model,
+                train_X=noise_train_X,
+                categorical_idx=categorical_idx,
+            )
 
     return model
 
@@ -370,6 +508,9 @@ def fit_classification_models(
     bounds: torch.Tensor = None,
     deep_gp: bool = False,
     deep_kernel: bool = False,
+    robust: bool = False,
+    perturbation: bool = False,
+    heteroscedastic: bool = False,
     list_hidden_dims: Optional[List[int]] = None,
     build_only: bool = False,
 ) -> List[Any]:
@@ -386,6 +527,9 @@ def fit_classification_models(
             bounds=bounds,
             deep_gp=deep_gp,
             deep_kernel=deep_kernel,
+            robust=robust,
+            perturbation=perturbation,
+            heteroscedastic=heteroscedastic,
             list_hidden_dims=list_hidden_dims,
             build_only=build_only,
         )
@@ -463,6 +607,9 @@ def fit_model(
                 bounds=bounds,
                 deep_gp=deep_gp,
                 deep_kernel=deep_kernel,
+                robust=robust,
+                perturbation=perturbation,
+                heteroscedastic=heteroscedastic,
                 list_hidden_dims=list_hidden_dims,
                 build_only=build_only,
             )[0]
