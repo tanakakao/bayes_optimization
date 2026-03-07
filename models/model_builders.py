@@ -332,10 +332,15 @@ def _build_deep_model(
     deep_gp: bool,
     deep_kernel: bool,
     input_transform: Optional[Any] = None,
+    list_hidden_dims: Optional[List[int]] = None,
 ) -> Optional[Any]:
     """Deep GP / Deep Kernel 系モデルの構築。"""
     m = train_Y.shape[-1]
     outcome_transform = Standardize(m=m)
+    if list_hidden_dims is None:
+        list_hidden_dims = [10, 5]
+    if len(list_hidden_dims) == 0:
+        raise ValueError("list_hidden_dims は1つ以上の要素を指定してください。")
 
     if deep_gp and deep_kernel:
         if categorical_idx:
@@ -346,7 +351,7 @@ def _build_deep_model(
                 input_transform=input_transform,
                 outcome_transform=outcome_transform,
                 likelihood=likelihood,
-                hidden_dim=5,
+                hidden_dim=list_hidden_dims[0],
             )
         return DeepKernelDeepGPModel(
             train_X,
@@ -354,7 +359,7 @@ def _build_deep_model(
             input_transform=input_transform,
             outcome_transform=outcome_transform,
             likelihood=likelihood,
-            list_hidden_dims=[10],
+            list_hidden_dims=list_hidden_dims,
         )
 
     elif deep_gp:
@@ -366,7 +371,7 @@ def _build_deep_model(
                 input_transform=input_transform,
                 outcome_transform=outcome_transform,
                 likelihood=likelihood,
-                hidden_dim=5,
+                hidden_dim=list_hidden_dims[0],
             )
         return DeepGPModel(
             train_X,
@@ -374,7 +379,7 @@ def _build_deep_model(
             likelihood=likelihood,
             input_transform=input_transform,
             outcome_transform=outcome_transform,
-            list_hidden_dims=[10, 5],
+            list_hidden_dims=list_hidden_dims,
         )
 
     elif deep_kernel:
