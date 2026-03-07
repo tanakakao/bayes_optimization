@@ -871,6 +871,15 @@ class ClassifierGPBinaryFromMulticlass(Model):
         preds = self.likelihood(latent)
         p = preds.mean
         var = preds.variance
+
+        noise_model = getattr(self, "noise_model", None)
+        if observation_noise and noise_model is not None:
+            noise_in = transformed_X if getattr(self, "noise_model_uses_transformed_inputs", True) else X
+            noise_log_var = noise_model.posterior(noise_in).mean
+            noise_var = torch.exp(noise_log_var).clamp_min(1e-9)
+            noise_var = noise_var.reshape_as(var)
+            var = var + noise_var
+
         return SimpleBernoulliPosterior(mean=p, variance=var)
 
     @property
@@ -1454,6 +1463,15 @@ class ClassifierMixedGPBinaryFromMulticlass(Model):
         preds = self.likelihood(latent)
         p = preds.mean
         var = preds.variance
+
+        noise_model = getattr(self, "noise_model", None)
+        if observation_noise and noise_model is not None:
+            noise_in = transformed_X if getattr(self, "noise_model_uses_transformed_inputs", True) else X
+            noise_log_var = noise_model.posterior(noise_in).mean
+            noise_var = torch.exp(noise_log_var).clamp_min(1e-9)
+            noise_var = noise_var.reshape_as(var)
+            var = var + noise_var
+
         return SimpleBernoulliPosterior(mean=p, variance=var)
 
     @property
